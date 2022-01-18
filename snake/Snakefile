@@ -1,0 +1,222 @@
+#!/usr/env/snakemake
+
+"""
+humblebragg Main Snakefile
+
+"""
+
+# my site packages (revisit for portability)
+#sys.path.insert(0, "/Users/jwinnikoff/opt/miniconda3/lib/python3.7/site-packages/")
+# for local modules
+sys.path.insert(0, "/Users/jwinnikoff/Documents/MBARI/SAXS/humblebragg/")
+
+import os
+import jscatter as jscat
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy
+import pandas as pd
+from copy import deepcopy
+
+import lamellar as lam
+import invsehex as hex
+import itfit
+import outfit
+
+def rawfiles(wildcards, suf):
+    "Generic globbing function for a series of raw data files"
+    return [wildcards["sample"]+"/02-fit0/"+infile.replace(".dat", "_"+suf+".par") for infile in os.listdir(wildcards["sample"]+"/01-raw")]
+
+def rawfiles_mcg(wildcards): 
+    return rawfiles(wildcards, "mcg")
+
+rule fit0_lamellar_series:
+    input: rawfiles_mcg
+    output: "{sample}/02-fit0/fit0mcg.chk"
+    run:
+        with open(output[0], 'w') as handle: pass
+
+# helper dict mapping fit suffixes to vector functions
+fit_suffs = {
+    "mcg"   : lam.mcg_full, # full MCG
+    "sfl"   : lam.sf_only , # Caille SF with Nu
+    #"lhg"   : sas.dm("lamellar_hg_stack_caille") # SASview direct model
+}
+
+# generic iterative fitting rule from preconfigured starting parameters
+rule fit0:
+    input:
+        data = "{sample}/01-raw/{filename}.dat"
+    output:
+        para = "{sample}/02-fit0/{filename}_{mod}.par",
+        best = "{sample}/02-fit0/{filename}_{mod}_best.dat",
+        last = "{sample}/02-fit0/{filename}_{mod}_last.dat"
+    message:
+        "a priori {wildcards[mod]} fit of {input}"
+    params:
+        gud = True, # guess d
+        yak = True, # report params while working
+    run:
+        # data transform can be specified here to see if it aids fitting
+        xfm = lambda x: x # identity
+        rfm = lambda x: x  # identity
+        #xfm = lambda x: 10**x # data transform
+        #rfm = np.log10  # inverse transform
+    
+        # load experimental data
+        data = jscat.dA(input["data"])
+        # prune (crop and sample) data
+        if config["prune"]:
+            # not an inplace method
+            data = data.prune(config["prune"]["min"], config["prune"]["max"], config["prune"]["npt"])
+        
+        # transform data
+        data.Y = xfm(data.Y)
+        
+        # transform fit function
+        # and apply smearing
+        # np.convolve(IMCT, np.rotate(psf, 2), mode="valid")
+        def mod(q, **kwargs):
+            return xfm(fit_suffs[wildcards["mod"]](q, vprof = np.array(config["vprof"]), **kwargs))
+            #return xfm(np.convolve(fit_suffs[wildcards["mod"]](q, **kwargs), np.flip(vprof), mode="same"))
+        
+        # define fitting iterations using a tuple of dicts of dicts
+        fitsteps = config["fit0_steps"][wildcards["mod"]]
+        if params["gud"]:
+            # guess the d-spacing. Hardwired to a lamellar guesser for now.
+            # widths changed from default for GAP example
+            #fitsteps[0]["freepar"]["d"] = lam.guessd_cwt(data[0], data[1])
+            fitsteps[0]["freepar"]["d"] = lam.guessd_cwt(data[0], data[1], widths=np.arange(25, 50))
+            print(fitsteps[0]["freepar"]["d"])
+        # impose limits
+        data.setlimit(**dict(config["fit0_limit"][wildcards["mod"]]))
+        
+        # now run iterative fit
+        # itfit as generator
+        fits = [deepcopy(fit) for fit in itfit.itfit(data, fitsteps, model=mod, plot=False, output=params["yak"])]
+        
+        #TODO ADD GENERIC TRANSFORM CALLS
+        for fit in fits:
+            fit.Y = rfm(fit.Y)
+            fit.lastfit.Y = xfm(fit.lastfit.Y)
+        
+        # and save everything
+        pars_out = pd.DataFrame.from_records([itfit.params_get(fit.lastfit) for fit in fits])
+        pars_out = pars_out.reindex(sorted(pars_out.columns), axis=1)
+        with open(output["para"], 'w') as handout_pars:
+            pars_out.to_csv(handout_pars, sep='\t', index=False)
+        
+        # save coords for the last fit
+        with open(output["last"], 'w') as handout_last:
+            outfit.coords_df(fits[-1]).to_csv(handout_last, sep='\t', index=False)
+        
+        # save coords for the best fit
+        fits.sort(key = lambda fit: fit.lastfit.chi2)
+        with open(output["best"], 'w') as handout_best:
+            outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
+
+## run iterative fit from a standard set of starting params
+#rule fit0_mcg:
+#    input:
+#        data = "{sample}/01-raw/{filename}.dat"
+#    output:
+#        para = "{sample}/02-fit0/{filename}_mcg.par",
+#        best = "{sample}/02-fit0/{filename}_mcg_best.dat",
+#        last = "{sample}/02-fit0/{filename}_mcg_last.dat"
+#    message:
+#        "Initial lamellar fit of {input}"
+#    params:
+#        # profile pruning/thinning params
+#        min = config["prune"]["min"],
+#        max = config["prune"]["max"],
+#        npt = config["prune"]["npt"],
+#        yak = False
+#    run:
+#        # load experimental data
+#        data = jscat.dA(input["data"])
+#        # prune (crop and sample) data
+#        # not an inplace operation
+#        data=data.prune(params["min"], params["max"], params["npt"])
+#        
+#        # define fitting iterations using a tuple of dicts of dicts
+#        fitsteps = config["fit0_mcg_steps"]
+#
+#        # guess the d-spacing
+#        fitsteps[0]["freepar"]["d"] = lam.guessd_cwt(data[0], data[1])
+#
+#        # define limits similarly
+#        limits   = dict(config["fit0_lam_limit"])
+#        
+#        # impose limits
+#        data.setlimit(**limits)
+#        
+#        # dynamic constraints can be added here
+#        #data.setConstrain(lambda sigC, sigH: (sigC >= sigH))
+#        
+#        # itfit as generator
+#        fits = [deepcopy(fit) for fit in itfit.itfit2(data, fitsteps, model=lam.mcg_full, plot=False, output=params["yak"])]
+#        
+#        # collate and save all fitted parameters
+#        pars_out = pd.DataFrame.from_records([itfit.params_get(fit.lastfit) for fit in fits])
+#        pars_out = pars_out.reindex(sorted(pars_out.columns), axis=1)
+#        with open(output["para"], 'w') as handout_pars:
+#            pars_out.to_csv(handout_pars, sep='\t', index=False)
+#        
+#        # save coords for the last fit
+#        with open(output["last"], 'w') as handout_last:
+#            outfit.coords_df(fits[-1]).to_csv(handout_last, sep='\t', index=False)
+#        
+#        # save coords for the best fit
+#        fits.sort(key = lambda fit: fit.lastfit.chi2)
+#        with open(output["best"], 'w') as handout_best:
+#            outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
+#            
+#def rawfiles_sfl(wildcards): 
+#    return rawfiles(wildcards, "sfl")  
+#            
+## lamellar SF-only fit
+#rule fit0_lam_sf:
+#    input:
+#        data = "{sample}/01-raw/{filename}.dat"
+#    output:
+#        para = "{sample}/02-fit0/{filename}_sfl.par",
+#        last = "{sample}/02-fit0/{filename}_sfl_last.dat"
+#    params:
+#        # profile pruning/thinning params
+#        min = config["prune"]["min"],
+#        max = config["prune"]["max"],
+#        npt = config["prune"]["npt"],
+#        yak = 1
+#    run:
+#        # load experimental data
+#        data = jscat.dA(input["data"])
+#        # prune (crop and sample) data
+#        # not an inplace operation
+#        data=data.prune(params["min"], params["max"], params["npt"])
+#        
+#        # load starting params from the lamellar fit config
+#        startvals = config["fit0_sfl_steps"][0]
+#        # drop the maxfev arg; this is not an iterative fit and must converge
+#        try: startvals.pop("maxfev")
+#        except: pass
+#        
+#        # guess the d-spacing
+#        startvals["freepar"]["d"] = lam.guessd_cwt(data[0], data[1])
+#
+#        # define limits similarly
+#        limits   = dict(config["fit0_sfl_limit"])
+#        
+#        # impose limits
+#        data.setlimit(**limits)
+#        
+#        data.fit(mapNames={'q':'X'}, model=lam.sf_only, output=params["yak"], **startvals)
+#        
+#        # save params
+#        pars_out = pd.DataFrame.from_records([itfit.params_get(data.lastfit)])
+#        pars_out = pars_out.reindex(sorted(pars_out.columns), axis=1)
+#        with open(output["para"], 'w') as handout_pars:
+#            pars_out.to_csv(handout_pars, sep='\t', index=False)
+#        
+#        # save fitted coords
+#        with open(output["last"], 'w') as handout_last:
+#            outfit.coords_df(data).to_csv(handout_last, sep='\t', index=False)

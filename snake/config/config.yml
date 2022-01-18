@@ -1,0 +1,84 @@
+# params for pruning and thinning raw data
+# (reduces fitting time)
+prune: 
+    min: 0.05
+    max: 0.7
+    npt: 500 # number of data points
+
+# itfit start params and steps for all a priori fit routines
+fit0_steps:
+    # for each model, can specify multiple fitting strategies
+    # these strategies should be given brief, informative names
+    mcg:
+        # best fit parameters in GAP manual
+        #gaptest:
+            #- {fixpar : {sigH : 3, d : 60.49, zH : 19.22, sigC : 6.581, rhor : -1.0, eta1 : 0.05032, N : 25.27, Nu : 0, offs : 35.27}, freepar : {scal : 0.0005406}} # GAP SOLUTION
+        # for Modified Caille Gaussian, per example in Georg Pabst's GAP manual
+        pabst_popc:
+            - {fixpar : {N : 25, eta1 : 0.07, zH : 20, sigH : 3, sigC : 4, rhor : -1, Nu : 0, offs : 0}, freepar : {d : 50, scal : 0.0001}, maxfev : 4}
+            - {fixpar : {N : 25, eta1 : 0.07, sigH : 3, sigC : 4, rhor : -1, Nu : 0, offs : 0}, freepar : {d, zH, scal}, maxfev : 4}
+            - {fixpar : {N : 25, eta1 : 0.07, sigH : 3, Nu : 0, offs : 0}, freepar : {d, zH, sigC, rhor, scal}, maxfev : 4}
+            - {fixpar : {N : 25, sigH : 3, Nu : 0, offs : 0}, freepar : {d, zH, sigC, rhor, eta1, scal}, maxfev : 4}
+            - {fixpar : {sigH : 3, Nu : 0}, freepar : {d, zH, sigC, rhor, eta1, scal, N, offs}, maxfev : 4}
+            - {fixpar : {sigH : 3}, freepar : {d, zH, sigC, rhor, eta1, N, Nu, scal, offs}}
+            ## fixing N and Nu
+            #- {fixpar : {sigH : 3, Nu : 0, N : 25}, freepar : {d, zH, sigC, rhor, eta1, scal, offs}, maxfev : 4}
+            #- {fixpar : {sigH : 3, Nu : 0, N : 25}, freepar : {d, zH, sigC, rhor, eta1, scal, offs}}
+        # same as Pabst POPC but takes the eta1-fitting stage to convergence
+        long_eta1:
+            - {fixpar : {N : 25, eta1 : 0.07, zH : 20, sigH : 3, sigC : 4, rhor : -1, Nu : 0, offs : 0}, freepar : {d : 50, scal : 0.0001}, maxfev : 4}
+            - {fixpar : {N : 25, eta1 : 0.07, sigH : 3, sigC : 4, rhor : -1, Nu : 0, offs : 0}, freepar : {d, zH, scal}, maxfev : 4}
+            - {fixpar : {N : 25, eta1 : 0.07, sigH : 3, Nu : 0, offs : 0}, freepar : {d, zH, sigC, rhor, scal}, maxfev : 4}
+            - {fixpar : {N : 25, sigH : 3, Nu : 0, offs : 0}, freepar : {d, zH, sigC, rhor, eta1, scal}}
+            - {fixpar : {sigH : 3, Nu : 0}, freepar : {d, zH, sigC, rhor, eta1, scal, N, offs}, maxfev : 4}
+            - {fixpar : {sigH : 3}, freepar : {d, zH, sigC, rhor, eta1, N, Nu, scal, offs}}
+    # for minimal fit using just a lamellar SF and diffuse scattering term
+    sfl:
+        onestep:
+            - {fixpar : {}, freepar : {N : 25, d : 50, scal : 1, eta1 : 0.1, offs : 0, Nu: 0.5}}
+
+# parameter upper and lower soft limits by fit type
+# YAML null translates to python None (no limit)     
+fit0_limit:
+    # MCG
+    mcg:
+#        rhor : [null, 0]
+        eta1   : [0,  null]
+        Nu   : [0,  null]
+        N    : [2,  null]
+#        offs : [0,  null]
+#        zH   : [5, null]
+    # Structure Factor Lamellar
+    sfl:
+        eta1   : [0,  null]
+        N    : [2,  null]
+        offs : [0,  null]
+        Nu   : [0,  null]
+        
+# placeholder (no smearing)
+vprof_null:
+    - 1
+
+# Pabst's 21-channel vertical profile
+vprof:
+    - 1.427830e-011
+    - 1.641077e-009
+    - 1.145472e-007
+    - 4.849480e-006
+    - 0.0001246525
+    - 0.001943549
+    - 0.01839738
+    - 0.1056510
+    - 0.3682892
+    - 0.7789868
+    - 1.000000
+    - 0.7790395
+    - 0.3682809
+    - 0.1056510
+    - 0.01839655
+    - 0.001943440
+    - 0.0001246356
+    - 4.848717e-006
+    - 1.145472e-007
+    - 1.641077e-009
+    - 1.427666e-011
