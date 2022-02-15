@@ -13,63 +13,22 @@ def pnames_get(fit, excl=("cov", "func_code", "func_name")):
 def params_get(fit):
     "Extract dict of fitted params from jscatter dataArray"
     return {attr: getattr(fit, attr) for attr in pnames_get(fit)}
-
-#def divein(iter):
-#    if isinstance(iter, (set, list, dict)):
-#        divein(iter)
-#
-#
-#def guess(fitsteps, data):
-#    """
-#    Evaluate model starting params specified as a function call.
-#    This actually means evaluating all string elements of the passed data
-#    structure in-place.
-#    """
-#    for el in fitsteps:
-#        if isinstance(el, (set, list, dict)):
+    
+def gen_fititers(params, fixfree):
+    """
+    From a dict of parameter values and a list of fixed/free specs, 
+    (from configfile) return a list of fititers for itfit.
+    """
+    # sub the values into the input structure
+    first = True
+    for iter in fixfree:
+        iter["fixpar"] = {par: params[par] for par in iter["fixpar"]}
+        if first: 
+            iter["freepar"] = {par: params[par] for par in iter["freepar"]}
+            first = False
+    return fixfree
         
-
-def itfit_old(data, fitsteps, plot=False, giveup=False, **kwargs):
-    """
-    Iterative fitting routine for an efficient search of high-dimensional
-    solution space.
-    
-    data is a jscatter dataArray
-    
-    giveup is a parameter I added to dataArray.fit() to allow non-converging
-    steps. See dataArray.py line 3377.
-    
-    fitsteps has a very specific format:
-    """
-    for i, step in enumerate(fitsteps):
-        # intial run
-        if not i:
-            # it's a little weird: debug mode 4 returns a dataArray containing
-            # the current *model*; this keeps it attached to the data
-            data.fit(mapNames={'q':'X'}, giveup=giveup, **step, **kwargs)
-        # subsequent steps
-        else:
-            try:
-                # extract freepar from the previous run
-                # .lastfit may be unnecessary
-                params_last = params_get(data.lastfit)
-            except:
-                params_last = params_get(data)
-                pass
-            # insert those starting values
-            step["freepar"] = {p:params_last[p] for p in step["freepar"]}
-            # fit again
-            data.fit(mapNames={'q':'X'}, giveup=giveup, **step, **kwargs)
-        # plot the data and fit
-        if plot:
-            plt.plot(data[0], data[1], color="C0")
-            plt.plot(data.lastfit[0], data.lastfit[1], color="C1")
-            plt.yscale("log")
-            plt.show()
-    # return the data with its parameters
-    return data
-
-def itfit(data, fitsteps, plot=False, giveup=False, **kwargs):
+def itfit(data, fititers, plot=False, giveup=False, **kwargs):
     """
     Iterative fitting routine for an efficient search of high-dimensional
     solution space.
@@ -77,18 +36,18 @@ def itfit(data, fitsteps, plot=False, giveup=False, **kwargs):
     data is a jscatter dataArray
     
     giveup is a switch I added to dataArray.fit() to allow non-converging
-    steps. See dataArray.py line 3377.
+    iters. See dataArray.py line 3377.
     
-    fitsteps has a very specific format:
+    fititers has a very specific format:
     
     This is now a generator function that yields the fitted dataArray following
-    every fit step (but not every func evaluation).
+    every fit iter (but not every func evaluation).
     """
-    for i, step in enumerate(fitsteps):
+    for i, iter in enumerate(fititers):
         # intial run
         if not i:
-            data.fit(mapNames={'q':'X'}, giveup=giveup, **step, **kwargs)
-        # subsequent steps
+            data.fit(mapNames={'q':'X'}, giveup=giveup, **iter, **kwargs)
+        # subsequent iters
         else:
             try:
                 # extract freepar from the previous run
@@ -98,9 +57,9 @@ def itfit(data, fitsteps, plot=False, giveup=False, **kwargs):
                 params_last = params_get(data)
                 pass
             # insert those starting values
-            step["freepar"] = {p:params_last[p] for p in step["freepar"]}
+            iter["freepar"] = {p:params_last[p] for p in iter["freepar"]}
             # fit again
-            data.fit(mapNames={'q':'X'}, giveup=giveup, **step, **kwargs)
+            data.fit(mapNames={'q':'X'}, giveup=giveup, **iter, **kwargs)
         # plot the data and fit
         if plot:
             plt.plot(data[0], data[1], color="C0")

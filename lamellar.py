@@ -3,7 +3,7 @@
 import numpy as np
 import statsmodels.api as sm
 import scipy
-from rebin import rebin
+#from rebin import rebin
 
 # components of MCG (Modified Caille Gaussian) model
 # default values are from Pabst spreadsheet
@@ -36,7 +36,7 @@ def sf_poly(q, d, eta1, N):
     # N MUST > 2
     # polydispersity
     # number of N-vals sampled
-    N = max(N, 0)
+    N = max(N, 2)
     nsf = int(30/np.log(N))
     # truncate to next odd number
     nsf += not nsf%2
@@ -116,7 +116,7 @@ def sf_only(q, **kwargs):
 def calcd(qs):
     "Helper function takes a list of peak qs, returns mean lamellar d-spacing"
     # in future, better to return list than mean?
-    return np.mean([(i+1)*2*np.pi/q[j] for i, j in enumerate(peaks)])
+    return np.mean([(i+1)*2*np.pi/j for i, j in enumerate(qs)])
 
 def guessd(q, iq, top_n=2):
     """
@@ -125,6 +125,7 @@ def guessd(q, iq, top_n=2):
     """
     peaks = [(q[i], iq[i]) for i in range(len(q))[1:-1] if (iq[i] > iq[i-1]) and (iq[i] > iq[i+1])]
     peaks = sorted(peaks, key=lambda coords: coords[1], reverse=True)[:top_n]
+    peaks, _ = list(zip(*peaks))
     return calcd(peaks)
 
 def guessd_lowess(q, iq, frac_smooth=0.01, **kwargs):
