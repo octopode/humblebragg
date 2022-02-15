@@ -16,25 +16,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy
 import pandas as pd
-from copy import deepcopy
+import datetime as dt
+import copy
+import re
 
 import lamellar as lam
-import invsehex as hex
+#import invsehex as hex
+import scape
 import itfit
+import bayes
+import profit
 import outfit
 
-def rawfiles(wildcards, suf):
-    "Generic globbing function for a series of raw data files"
-    return [wildcards["sample"]+"/02-fit0/"+infile.replace(".dat", "_"+suf+".par") for infile in os.listdir(wildcards["sample"]+"/01-raw")]
+from itertools import product
+from warnings import warn
 
-def rawfiles_mcg(wildcards): 
-    return rawfiles(wildcards, "mcg")
-
-rule fit0_lamellar_series:
-    input: rawfiles_mcg
-    output: "{sample}/02-fit0/fit0mcg.chk"
-    run:
-        with open(output[0], 'w') as handle: pass
+maxthreads = 8
 
 # helper dict mapping fit suffixes to vector functions
 fit_suffs = {
@@ -43,26 +40,352 @@ fit_suffs = {
     #"lhg"   : sas.dm("lamellar_hg_stack_caille") # SASview direct model
 }
 
+# establish series grid list of lists as global object
+grid = profit.makegrid(config["dirs"]["scape"])
+coords_grid = set(product(range(len(grid[0])), range(len(grid))))
+moves = profit.moves(config["soak_radius"])
+# send config object to modules
+profit.config = config
+scape.config  = config
+bayes.config  = config
+
+def symlink(*args):
+    "Symlink relative to cwd"
+    os.symlink(*[os.path.join(os.getcwd(), loc) for loc in args])
+
+### LANDSCAPING ###
+
+def scape_in(wildcards={}):
+    "Aggregate all raw profiles"
+    return [os.path.join(config["dirs"]["raw"], file) for file in os.listdir(config["dirs"]["raw"]) if os.path.splitext(file)[1] == ".dat"]
+    
+def scape_out():
+    "Use prespecified interpolation params to name output profiles"
+    try:
+        # compile regexes
+        re_x = re.compile(config["scape"]["re_x"])
+        re_y = re.compile(config["scape"]["re_y"])
+        
+        xs, ys = zip(*[scape.parse_coords(file, re_x, re_y) for file in scape_in()])
+        xs, ys = scape.makegrid(xs, ys)
+        # make filenames short as possible
+        xs, ys = [scape.min_precise(vals) for vals in (xs, ys)]
+        
+        # generate integer indices
+        x, y = [tuple(sorted(list(set(vals)))) for vals in (xs, ys)]
+        i, j = [tuple(range(len(vals))) for vals in (x, y)]
+        # count digits
+        digits = [max([len(str(l)) for l in k]) for k in (x, y, i, j)]
+        
+        # probably need to keep an eye on this formatting
+        def format_outfile(i, j):
+            fname = "{samp}_{x}{unx}_{y}{uny}_X{i}_Y{j}.dat".format(
+                samp=os.path.split(os.getcwd())[-1], 
+                x = str(x[i]).zfill(digits[0]), 
+                y = str(y[j]).zfill(digits[1]),
+                i = str(i).zfill(digits[2]),
+                j = str(j).zfill(digits[3]),
+                unx = config["scape"]["un_x"],
+                uny = config["scape"]["un_y"]
+            )
+            return fname
+        
+        outfiles = [os.path.join(config["dirs"]["scape"], format_outfile(*ij)) for ij in product(i, j)]
+        return outfiles
+    except:
+        warn("no grid info")
+        return []
+
+rule scape:
+    # any change in raw data will trigger reexecution 
+    input: scape_in
+    output: 
+        scape = os.path.join(config["dirs"]["scape"], "full_scape.tsv"),
+        shots = scape_out()
+    message: "using {config[scape][spline]} to interpolate SAXS profiles"
+    threads: maxthreads
+    run: scape.scape(input, output, threads, wildcards)
+            
+### FIT S**T ###
+
+# <useless?>
+def next_summary(wildcards):
+    "Conjure filename for the next summary"
+    dirs_exist = sorted([dir for dir in os.path.listdir() if os.path.isdir(dir)])
+    return os.path.join(profit.diridx(dirs_exist[-1], 1), "summary_mcg.tsv")
+
+# input rule to run the next round of fits
+rule level_up:
+    input: next_summary
+# </useless?>
+
+def last_summary(wildcards):
+    # check if asking for summary of fit0 (then there is no last summary!)
+    if wildcards["dir"] != config["dirs"]["fit0"]:
+        summfile = os.path.join(profit.diridx(wildcards["dir"], -1), "summary_{}_{}.tsv".format(wildcards["mod"], wildcards["opt"]))
+        # can't find it? change the wildcard!
+        if not os.path.exists(os.path.join(os.getcwd(), summfile)): wildcards.opt = "lm"
+        summfile = os.path.join(profit.diridx(wildcards["dir"], -1), "summary_{}_{}.tsv".format(wildcards["mod"], wildcards["opt"]))
+        return summfile
+        #return os.path.join(profit.diridx(wildcards["dir"], -1), "summary_{}_{}.tsv".format(wildcards["mod"], wildcards["opt"]))
+    else:
+        return []
+
+def latest_pars(wildcards):
+    "input function returns all the parent parfiles for a level_up call"
+    return [os.path.join(wildcards["dir"], "{}_{}_{}.par".format(shotcoords, wildcards["mod"], wildcards["opt"])) for shotcoords in sum(grid, [])]
+
+# generic rule to make the next level of fits and summary file, bless best fit
+checkpoint summarize:
+    input: 
+        summ = last_summary,
+        para = latest_pars
+    output: 
+        os.path.join("{dir}", "summary_{mod}_{opt}.tsv"),
+    wildcard_constraints:
+        # might require abstraction
+        mod = "mcg|hex",
+        opt = "lm|mc",
+    run:
+        # look up either best or last params for each shot in grid
+        pars_fitted = pd.DataFrame()
+        for parfile in input["para"]:
+            pars = pd.read_csv(parfile, sep='\t')
+            if config["best_fit"]:
+                try: pars.sort_values("chi2", ascending=False, na_position='first', inplace=True)
+                except: pass
+            # add the best or last params to dataframe
+            shot = profit.parse_coords(os.path.basename(parfile))[0]
+            pars["shot"] = shot
+            # log its ctime, too
+            file_time = dt.datetime.fromtimestamp(os.path.getctime(parfile))
+            pars["time"] = file_time.strftime("%Y%m%d %H%M%S")
+            pars_fitted = pars_fitted.append(pars.iloc[-1])
+        # sort all the results by decreasing chi2
+        pars_fitted.sort_values("chi2", ascending=False, na_position='first', inplace=True)
+        #TODO this would be a convenient place to plot chi2s
+        # for the first round from the pars_fitted DF
+        # for now, just save the table
+        with open(output[0], 'w') as handout:
+            pars_fitted.to_csv(handout, sep='\t', index=False)
+        ## bless the best fit by copying its parameters to the next fit dir
+        #next_dir = os.path.join(profit.diridx(wildcards["dir"], 1))
+        #try: os.mkdir(next_dir)
+        #except: pass
+        #blest_fit = os.path.join(next_dir, pars_fitted.iloc[-1]["shot"])
+        #with open(blest_fit, 'w') as handout:
+        #    pars_fitted.iloc[-1:].drop("shot", axis=1).to_csv(handout, sep='\t', index=False)
+
+def apriori_in(wildcards):
+    "Just demand fit0s for every .dat file in 02-scape"
+    return [os.path.join(config["dirs"]["fit0"], file.replace(".dat", "_mcg.par")) for file in os.listdir(config["dirs"]["scape"]) if ".dat" in file]
+
+## a grid-agnostic stand-in for summarize       
+checkpoint apriori:
+    input: apriori_in
+
+def fitn(input, output, params, wildcards, threads):
+    "Generic progressive fit function, called by directional rules"
+    
+    # data transform can be specified here to see if it aids fitting
+    xfm = lambda x: x # identity
+    rfm = lambda x: x  # identity
+    #xfm = lambda x: 10**x # data transform
+    #rfm = np.log10  # inverse transform
+    
+    # load experimental data
+    data = jscat.dA(input["data"])
+    # prune (crop and sample) data
+    if config["prune"]:
+        data = data.prune(config["prune"]["min"], config["prune"]["max"], config["prune"]["npt"])
+    # transform data
+    data.Y = xfm(data.Y)
+    # transform fit function and apply smearing
+    def mod(q, **kwargs):
+        return xfm(fit_suffs[wildcards["mod"]](q, vprof = np.array(config["vprof"]), **kwargs))
+    # load params from neighbor
+    pars_start = profit.load_pars(input["para"], mod=fit_suffs[wildcards["mod"]], best=config["best_fit"])
+
+    # impose limits
+    data.setlimit(**dict(config["limits"][wildcards["mod"]]))
+    
+    # the LM/Bayes switch
+    if wildcards["opt"] == "lm":
+        fititers = itfit.gen_fititers(
+            pars_start,
+            config["iters"]["mcg_pabst"]
+        )
+        # run iterative fit
+        fits = [copy.deepcopy(fit) for fit in itfit.itfit(data, fititers, model=mod, plot=False, output=config["yak"])]
+        
+        # retransform
+        for fit in fits:
+            fit.Y = rfm(fit.Y)
+            fit.lastfit.Y = xfm(fit.lastfit.Y)
+        
+        # and put everything in a DF to save
+        pars_out = pd.DataFrame.from_records([itfit.params_get(fit.lastfit) for fit in fits])
+        
+        # save coords for the last fit
+        with open(output["last"], 'w') as handout_last:
+            outfit.coords_df(fits[-1]).to_csv(handout_last, sep='\t', index=False)
+        
+        # save coords for the best fit
+        fits.sort(key = lambda fit: fit.lastfit.chi2)
+        with open(output["best"], 'w') as handout_best:
+            outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
+
+    elif wildcards["opt"] == "mc":
+        fititers = itfit.gen_fititers(
+            pars_start,
+            config["iters"]["mcg_bayes"]
+        )
+        # run Bayesian iterative opt
+        kwargs = {
+            "data"     : data,
+            "fititers" : fititers,
+            "model"    : mod,
+            "plots"    : False,
+            "ioff"     : False,
+            "ncpu"     : threads,
+            "savefile" : params["pick"],
+            "pstep"    : config["steps"][wildcards["mod"]],
+        }
+        fits = [copy.deepcopy(fit) for fit in bayes.itfit(**kwargs)]
+
+        # retransform
+        for fit in fits:
+            fit.Y = rfm(fit.Y)
+            fit.mcmcfit["best_model"] = xfm(fit.mcmcfit["best_model"])
+            
+        # and put everything in a DF to save
+        pars_out = pd.DataFrame.from_records([bayes.params_get(fit.mcmcfit) for fit in fits])
+        
+        # save coords for the last fit
+        with open(output["last"], 'w') as handout_last:
+            outfit.coords_df(fits[-1]).to_csv(handout_last, sep='\t', index=False)
+        
+        # save coords for the best fit
+        fits.sort(key = lambda fit: bayes.params_get(fit.mcmcfit)["chi2"])
+        with open(output["best"], 'w') as handout_best:
+            outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
+    
+    # save the parameters
+    pars_out = pars_out.reindex(sorted(pars_out.columns), axis=1)
+    with open(output["para"], 'w') as handout_pars:
+        pars_out.to_csv(handout_pars, sep='\t', index=False)
+
+## FIT1 RULES
+#  are direction-specific: even though they all do the same thing,
+#  the wildcards tell them where to borrow parameters from
+def borrow(wildcards, move):
+    "take wildcards from a fitn rule and a 2-element move vector"
+    #print(wildcards) #TEST
+    x, y = np.array((wildcards["x"], wildcards["y"]), dtype=int) + move
+    # prioritize results generated using the same optimizer
+    # if those files do not exist, return the same file with any optimizer
+    parfile = grid[y][x].split('_X')[0] + "_X{}_Y{}_".format(x, y) + wildcards["mod"] + '_' + wildcards["opt"] + ".par"
+    if not os.path.exists(os.path.join(os.getcwd(), parfile)):
+        parfile = grid[y][x].split('_X')[0] + "_X{}_Y{}_".format(x, y) + wildcards["mod"] + "_lm"+ ".par"
+    input = os.path.join(
+        profit.diridx(wildcards["dir"], -1), 
+        parfile
+    )
+    return input
+
+def fitn_pars(wildcards):
+    "Input function specifying parfile to borrow from"
+    return [borrow(wildcards, np.int16(np.array([wildcards['i'], wildcards['j']])))]
+    
+def fitn_threads(wildcards):
+    if   wildcards["opt"] == "lm": return 1
+    elif wildcards["opt"] == "mc": return config["bayes_cores"]
+        
+rule fitn:
+    input:
+        data = os.path.join(config["dirs"]["scape"], "{filename}_X{x}_Y{y}.dat"),
+        para = fitn_pars,
+    output:
+        best = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_{opt}_best.dat"),
+        last = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_{opt}_last.dat"),
+        para = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_{opt}.par"),
+    params:
+        # MC3 pickle
+        pick = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_{opt}.npz"),
+    message:
+        "progressive fit: {wildcards[dir]}/{wildcards[filename]} looking ({wildcards[i]}, {wildcards[j]})"
+    threads:
+        fitn_threads
+    run:
+        fitn(input, output, params, wildcards, threads)
+
+def fitn_outs(wildcards):
+    "Input function specifying all required fitns"
+    x, y = (int(wildcards['x']), int(wildcards['y']))
+    coords_borrow = {tuple(np.array([x,y]) + np.array(move)) for move in moves}.intersection(coords_grid)
+    def parfile(x_b, y_b):
+        file = os.path.join(
+            wildcards["dir"], 
+            "{}_X{}_Y{}".format(wildcards["filename"], x, y), 
+            "{}_i{}_j{}_{}_{}.par".format(wildcards["filename"], x_b-x, y_b-y, wildcards["mod"], wildcards["opt"])
+        )
+        return file
+    return [parfile(*coords) for coords in coords_borrow]
+
+# fitn aggregator-linker        
+rule fitn_link:
+    input:
+        para = fitn_outs,
+    output:
+        #best = os.path.join("{dir}", "{filename}_X{x}_Y{y}_{mod}_best.dat"),
+        #last = os.path.join("{dir}", "{filename}_X{x}_Y{y}_{mod}_last.dat"),
+        para = os.path.join("{dir}", "{filename}_X{x}_Y{y}_{mod}_{opt}.par"),
+    wildcard_constraints:
+        dir = "(?!"+config["dirs"]["fit0"]+").*", # prevent collision with fit0
+        #mod = "[^\/]*", # prevent circular dependency
+        y = "[0-9]*",
+    run:
+        best_pars = pd.DataFrame()
+        for filename in input["para"]:
+            this_pars = pd.read_csv(filename, sep='\t')
+            # saving the filename in a column
+            this_pars["source"] = filename
+            this_pars.sort_values("chi2", ascending=False, inplace=True)
+            best_pars = best_pars.append(this_pars.iloc[-1,], ignore_index=True)
+        # either link out the best fit
+        if config["soak_method"] == "best":
+            best_pars.sort_values("chi2", ascending=False, inplace=True)
+            symlink(best_pars.iloc[-1,]["source"], output["para"])
+            # link profiles too
+            for suff in ("_best.dat", "_last.dat"):
+                symlink(best_pars.iloc[-1,]["source"].replace(".par", suff), output["para"].replace(".par", suff))
+        # or average them all
+        elif config["soak_method"] == "mean":
+            # and save to file
+            borrowed.select_dtypes("number").mean(axis=0,skipna=True).to_csv(output["para"], sep='\t')
+
 # generic iterative fitting rule from preconfigured starting parameters
 rule fit0:
     input:
-        data = "{sample}/01-raw/{filename}.dat"
+        para = os.path.join(config["dirs"]["fit0"], "init_{mod}.par"),
+        data = os.path.join(config["dirs"]["scape"], "{filename}.dat"),
     output:
-        para = "{sample}/02-fit0/{filename}_{mod}.par",
-        best = "{sample}/02-fit0/{filename}_{mod}_best.dat",
-        last = "{sample}/02-fit0/{filename}_{mod}_last.dat"
+        para = os.path.join(config["dirs"]["fit0"], "{filename}_{mod}_lm.par"),
+        best = os.path.join(config["dirs"]["fit0"], "{filename}_{mod}_lm_best.dat"),
+        last = os.path.join(config["dirs"]["fit0"], "{filename}_{mod}_lm_last.dat"),
+    wildcard_constraints:
+        filename = "(?!init).*",
     message:
         "a priori {wildcards[mod]} fit of {input}"
     params:
-        gud = True, # guess d
-        yak = True, # report params while working
+        gds = 1, # guess d, # is top_n peaks
+        iterspec = "mcg_pabst",
     run:
         # data transform can be specified here to see if it aids fitting
         xfm = lambda x: x # identity
-        rfm = lambda x: x  # identity
+        rfm = lambda x: x # identity
         #xfm = lambda x: 10**x # data transform
         #rfm = np.log10  # inverse transform
-    
         # load experimental data
         data = jscat.dA(input["data"])
         # prune (crop and sample) data
@@ -75,27 +398,24 @@ rule fit0:
         
         # transform fit function
         # and apply smearing
-        # np.convolve(IMCT, np.rotate(psf, 2), mode="valid")
         def mod(q, **kwargs):
             return xfm(fit_suffs[wildcards["mod"]](q, vprof = np.array(config["vprof"]), **kwargs))
-            #return xfm(np.convolve(fit_suffs[wildcards["mod"]](q, **kwargs), np.flip(vprof), mode="same"))
         
         # define fitting iterations using a tuple of dicts of dicts
-        fitsteps = config["fit0_steps"][wildcards["mod"]]
-        if params["gud"]:
+        fititers = itfit.gen_fititers(
+            profit.load_pars(input["para"], fit_suffs[wildcards["mod"]]),
+            config["iters"][params["iterspec"]]
+        )
+        if params["gds"]:
             # guess the d-spacing. Hardwired to a lamellar guesser for now.
-            # widths changed from default for GAP example
-            #fitsteps[0]["freepar"]["d"] = lam.guessd_cwt(data[0], data[1])
-            fitsteps[0]["freepar"]["d"] = lam.guessd_cwt(data[0], data[1], widths=np.arange(25, 50))
-            print(fitsteps[0]["freepar"]["d"])
+            fititers[0]["freepar"]["d"] = lam.guessd(data[0], data[1], top_n=params["gds"])
         # impose limits
-        data.setlimit(**dict(config["fit0_limit"][wildcards["mod"]]))
+        data.setlimit(**dict(config["limits"][wildcards["mod"]]))
         
         # now run iterative fit
         # itfit as generator
-        fits = [deepcopy(fit) for fit in itfit.itfit(data, fitsteps, model=mod, plot=False, output=params["yak"])]
+        fits = [copy.deepcopy(fit) for fit in itfit.itfit(data, fititers, model=mod, plot=False, output=config["yak"])]
         
-        #TODO ADD GENERIC TRANSFORM CALLS
         for fit in fits:
             fit.Y = rfm(fit.Y)
             fit.lastfit.Y = xfm(fit.lastfit.Y)
@@ -114,109 +434,3 @@ rule fit0:
         fits.sort(key = lambda fit: fit.lastfit.chi2)
         with open(output["best"], 'w') as handout_best:
             outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
-
-## run iterative fit from a standard set of starting params
-#rule fit0_mcg:
-#    input:
-#        data = "{sample}/01-raw/{filename}.dat"
-#    output:
-#        para = "{sample}/02-fit0/{filename}_mcg.par",
-#        best = "{sample}/02-fit0/{filename}_mcg_best.dat",
-#        last = "{sample}/02-fit0/{filename}_mcg_last.dat"
-#    message:
-#        "Initial lamellar fit of {input}"
-#    params:
-#        # profile pruning/thinning params
-#        min = config["prune"]["min"],
-#        max = config["prune"]["max"],
-#        npt = config["prune"]["npt"],
-#        yak = False
-#    run:
-#        # load experimental data
-#        data = jscat.dA(input["data"])
-#        # prune (crop and sample) data
-#        # not an inplace operation
-#        data=data.prune(params["min"], params["max"], params["npt"])
-#        
-#        # define fitting iterations using a tuple of dicts of dicts
-#        fitsteps = config["fit0_mcg_steps"]
-#
-#        # guess the d-spacing
-#        fitsteps[0]["freepar"]["d"] = lam.guessd_cwt(data[0], data[1])
-#
-#        # define limits similarly
-#        limits   = dict(config["fit0_lam_limit"])
-#        
-#        # impose limits
-#        data.setlimit(**limits)
-#        
-#        # dynamic constraints can be added here
-#        #data.setConstrain(lambda sigC, sigH: (sigC >= sigH))
-#        
-#        # itfit as generator
-#        fits = [deepcopy(fit) for fit in itfit.itfit2(data, fitsteps, model=lam.mcg_full, plot=False, output=params["yak"])]
-#        
-#        # collate and save all fitted parameters
-#        pars_out = pd.DataFrame.from_records([itfit.params_get(fit.lastfit) for fit in fits])
-#        pars_out = pars_out.reindex(sorted(pars_out.columns), axis=1)
-#        with open(output["para"], 'w') as handout_pars:
-#            pars_out.to_csv(handout_pars, sep='\t', index=False)
-#        
-#        # save coords for the last fit
-#        with open(output["last"], 'w') as handout_last:
-#            outfit.coords_df(fits[-1]).to_csv(handout_last, sep='\t', index=False)
-#        
-#        # save coords for the best fit
-#        fits.sort(key = lambda fit: fit.lastfit.chi2)
-#        with open(output["best"], 'w') as handout_best:
-#            outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
-#            
-#def rawfiles_sfl(wildcards): 
-#    return rawfiles(wildcards, "sfl")  
-#            
-## lamellar SF-only fit
-#rule fit0_lam_sf:
-#    input:
-#        data = "{sample}/01-raw/{filename}.dat"
-#    output:
-#        para = "{sample}/02-fit0/{filename}_sfl.par",
-#        last = "{sample}/02-fit0/{filename}_sfl_last.dat"
-#    params:
-#        # profile pruning/thinning params
-#        min = config["prune"]["min"],
-#        max = config["prune"]["max"],
-#        npt = config["prune"]["npt"],
-#        yak = 1
-#    run:
-#        # load experimental data
-#        data = jscat.dA(input["data"])
-#        # prune (crop and sample) data
-#        # not an inplace operation
-#        data=data.prune(params["min"], params["max"], params["npt"])
-#        
-#        # load starting params from the lamellar fit config
-#        startvals = config["fit0_sfl_steps"][0]
-#        # drop the maxfev arg; this is not an iterative fit and must converge
-#        try: startvals.pop("maxfev")
-#        except: pass
-#        
-#        # guess the d-spacing
-#        startvals["freepar"]["d"] = lam.guessd_cwt(data[0], data[1])
-#
-#        # define limits similarly
-#        limits   = dict(config["fit0_sfl_limit"])
-#        
-#        # impose limits
-#        data.setlimit(**limits)
-#        
-#        data.fit(mapNames={'q':'X'}, model=lam.sf_only, output=params["yak"], **startvals)
-#        
-#        # save params
-#        pars_out = pd.DataFrame.from_records([itfit.params_get(data.lastfit)])
-#        pars_out = pars_out.reindex(sorted(pars_out.columns), axis=1)
-#        with open(output["para"], 'w') as handout_pars:
-#            pars_out.to_csv(handout_pars, sep='\t', index=False)
-#        
-#        # save fitted coords
-#        with open(output["last"], 'w') as handout_last:
-#            outfit.coords_df(data).to_csv(handout_last, sep='\t', index=False)
