@@ -19,6 +19,7 @@ import pandas as pd
 import datetime as dt
 import copy
 import re
+import mc3.plots as mcp
 
 import lamellar as lam
 #import invsehex as hex
@@ -183,8 +184,41 @@ def apriori_in(wildcards):
 ## a grid-agnostic stand-in for summarize       
 checkpoint apriori:
     input: apriori_in
+    
+### FIT-n RULES
 
-def fitn(input, output, params, wildcards, threads):
+def borrow_old(wildcards, move):
+    "take wildcards from a fitn rule and a 2-element move vector"
+    #print(wildcards) #TEST
+    x, y = np.array((wildcards["x"], wildcards["y"]), dtype=int) + move
+    # prioritize results generated using the same optimizer
+    # if those files do not exist, return the same file with any optimizer
+    parfile = grid[y][x].split('_X')[0] + "_X{}_Y{}_".format(x, y) + wildcards["mod"] + '_' + wildcards["opt"] + ".par"
+    if not os.path.exists(os.path.join(os.getcwd(), parfile)):
+        parfile = grid[y][x].split('_X')[0] + "_X{}_Y{}_".format(x, y) + wildcards["mod"] + "_lm"+ ".par"
+    input = os.path.join(
+        profit.diridx(wildcards["dir"], -1), 
+        parfile
+    )
+    return input
+
+# in general, MCMC is only run as a final polisher
+def borrow(wildcards, move):
+    "take wildcards from a fitn rule and a 2-element move vector"
+    #print(wildcards) #TEST
+    x, y = np.array((wildcards["x"], wildcards["y"]), dtype=int) + move
+    parfile = grid[y][x].split('_X')[0] + "_X{}_Y{}_".format(x, y) + wildcards["mod"] + "_lm"+ ".par"
+    input = os.path.join(
+        profit.diridx(wildcards["dir"], -1), 
+        parfile
+    )
+    return input
+
+def fitn_pars(wildcards):
+    "Input function specifying parfile to borrow from"
+    return [borrow(wildcards, np.int16(np.array([wildcards['i'], wildcards['j']])))]
+      
+def fitn_lm(input, output, params, wildcards):
     "Generic progressive fit function, called by directional rules"
     
     # data transform can be specified here to see if it aids fitting
@@ -209,115 +243,161 @@ def fitn(input, output, params, wildcards, threads):
     # impose limits
     data.setlimit(**dict(config["limits"][wildcards["mod"]]))
     
-    # the LM/Bayes switch
-    if wildcards["opt"] == "lm":
-        fititers = itfit.gen_fititers(
-            pars_start,
-            config["iters"]["mcg_pabst"]
-        )
-        # run iterative fit
-        fits = [copy.deepcopy(fit) for fit in itfit.itfit(data, fititers, model=mod, plot=False, output=config["yak"])]
+    fititers = itfit.gen_fititers(
+        pars_start,
+        config["iters"]["mcg_pabst"]
+    )
+    # run iterative fit
+    fits = [copy.deepcopy(fit) for fit in itfit.itfit(data, fititers, model=mod, plot=False, output=config["yak"])]
+    
+    # retransform
+    for fit in fits:
+        fit.Y = rfm(fit.Y)
+        fit.lastfit.Y = xfm(fit.lastfit.Y)
+    
+    # and put everything in a DF to save
+    pars_out = pd.DataFrame.from_records([itfit.params_get(fit.lastfit) for fit in fits])
+    
+    # save coords for the last fit
+    with open(output["last"], 'w') as handout_last:
+        outfit.coords_df(fits[-1]).to_csv(handout_last, sep='\t', index=False)
+    
+    # save coords for the best fit
+    fits.sort(key = lambda fit: fit.lastfit.chi2)
+    with open(output["best"], 'w') as handout_best:
+        outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
+    
+    # save the parameters
+    pars_out = pars_out.reindex(sorted(pars_out.columns), axis=1)
+    with open(output["para"], 'w') as handout_pars:
+        pars_out.to_csv(handout_pars, sep='\t', index=False)
         
-        # retransform
-        for fit in fits:
-            fit.Y = rfm(fit.Y)
-            fit.lastfit.Y = xfm(fit.lastfit.Y)
-        
-        # and put everything in a DF to save
-        pars_out = pd.DataFrame.from_records([itfit.params_get(fit.lastfit) for fit in fits])
-        
-        # save coords for the last fit
-        with open(output["last"], 'w') as handout_last:
-            outfit.coords_df(fits[-1]).to_csv(handout_last, sep='\t', index=False)
-        
-        # save coords for the best fit
-        fits.sort(key = lambda fit: fit.lastfit.chi2)
-        with open(output["best"], 'w') as handout_best:
-            outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
+rule fitn_lm:
+    input:
+        data = os.path.join(config["dirs"]["scape"], "{filename}_X{x}_Y{y}.dat"),
+        para = fitn_pars,
+    output:
+        best = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_lm_best.dat"),
+        last = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_lm_last.dat"),
+        para = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_lm.par"),
+    message:
+        "progressive fit: {wildcards[dir]}/{wildcards[filename]} looking ({wildcards[i]}, {wildcards[j]})"
+    run:
+        fitn_lm(input, output, params, wildcards)
 
-    elif wildcards["opt"] == "mc":
-        fititers = itfit.gen_fititers(
-            pars_start,
-            config["iters"]["mcg_bayes"]
-        )
-        # run Bayesian iterative opt
-        kwargs = {
-            "data"     : data,
-            "fititers" : fititers,
-            "model"    : mod,
-            "plots"    : False,
-            "ioff"     : False,
-            "ncpu"     : threads,
-            "savefile" : params["pick"],
-            "pstep"    : config["steps"][wildcards["mod"]],
-        }
-        fits = [copy.deepcopy(fit) for fit in bayes.itfit(**kwargs)]
+def fitn_mc(input, output, params, wildcards, threads):
+    "Generic progressive fit function, called by directional rules"
+    
+    # data transform can be specified here to see if it aids fitting
+    xfm = lambda x: x # identity
+    rfm = lambda x: x  # identity
+    #xfm = lambda x: 10**x # data transform
+    #rfm = np.log10  # inverse transform
+    
+    # load experimental data
+    data = jscat.dA(input["data"])
+    # prune (crop and sample) data
+    if config["prune"]:
+        data = data.prune(config["prune"]["min"], config["prune"]["max"], config["prune"]["npt"])
+    # transform data
+    data.Y = xfm(data.Y)
+    # transform fit function and apply smearing
+    def mod(q, **kwargs):
+        return xfm(fit_suffs[wildcards["mod"]](q, vprof = np.array(config["vprof"]), **kwargs))
+    # load params from neighbor
+    pars_start = profit.load_pars(input["para"], mod=fit_suffs[wildcards["mod"]], best=config["best_fit"])
 
-        # retransform
-        for fit in fits:
-            fit.Y = rfm(fit.Y)
-            fit.mcmcfit["best_model"] = xfm(fit.mcmcfit["best_model"])
-            
-        # and put everything in a DF to save
-        pars_out = pd.DataFrame.from_records([bayes.params_get(fit.mcmcfit) for fit in fits])
+    # impose limits
+    data.setlimit(**dict(config["limits"][wildcards["mod"]]))
+    
+    fititers = itfit.gen_fititers(
+        pars_start,
+        config["iters"]["mcg_bayes"]
+    )
+    # run Bayesian iterative opt
+    kwargs = {
+        "data"     : data,
+        "fititers" : fititers,
+        "model"    : mod,
+        "plots"    : False,
+        "ioff"     : False,
+        "ncpu"     : threads,
+        "savefile" : output["pick"],
+        "pstep"    : config["steps"][wildcards["mod"]],
+    }
+    fits = [copy.deepcopy(fit) for fit in bayes.itfit(**kwargs)]
+
+    # retransform
+    for fit in fits:
+        fit.Y = rfm(fit.Y)
+        fit.mcmcfit["best_model"] = xfm(fit.mcmcfit["best_model"])
         
-        # save coords for the last fit
-        with open(output["last"], 'w') as handout_last:
-            outfit.coords_df(fits[-1]).to_csv(handout_last, sep='\t', index=False)
-        
-        # save coords for the best fit
-        fits.sort(key = lambda fit: bayes.params_get(fit.mcmcfit)["chi2"])
-        with open(output["best"], 'w') as handout_best:
-            outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
+    # and put everything in a DF to save
+    pars_out = pd.DataFrame.from_records([bayes.params_get(fit.mcmcfit) for fit in fits])
+    
+    # save coords for the last fit
+    with open(output["last"], 'w') as handout_last:
+        outfit.coords_df(fits[-1]).to_csv(handout_last, sep='\t', index=False)
+    
+    # save coords for the best fit
+    fits.sort(key = lambda fit: bayes.params_get(fit.mcmcfit)["chi2"])
+    with open(output["best"], 'w') as handout_best:
+        outfit.coords_df(fits[0]).to_csv(handout_best, sep='\t', index=False)
     
     # save the parameters
     pars_out = pars_out.reindex(sorted(pars_out.columns), axis=1)
     with open(output["para"], 'w') as handout_pars:
         pars_out.to_csv(handout_pars, sep='\t', index=False)
 
-## FIT1 RULES
-#  are direction-specific: even though they all do the same thing,
-#  the wildcards tell them where to borrow parameters from
-def borrow(wildcards, move):
-    "take wildcards from a fitn rule and a 2-element move vector"
-    #print(wildcards) #TEST
-    x, y = np.array((wildcards["x"], wildcards["y"]), dtype=int) + move
-    # prioritize results generated using the same optimizer
-    # if those files do not exist, return the same file with any optimizer
-    parfile = grid[y][x].split('_X')[0] + "_X{}_Y{}_".format(x, y) + wildcards["mod"] + '_' + wildcards["opt"] + ".par"
-    if not os.path.exists(os.path.join(os.getcwd(), parfile)):
-        parfile = grid[y][x].split('_X')[0] + "_X{}_Y{}_".format(x, y) + wildcards["mod"] + "_lm"+ ".par"
-    input = os.path.join(
-        profit.diridx(wildcards["dir"], -1), 
-        parfile
-    )
-    return input
-
-def fitn_pars(wildcards):
-    "Input function specifying parfile to borrow from"
-    return [borrow(wildcards, np.int16(np.array([wildcards['i'], wildcards['j']])))]
-    
-def fitn_threads(wildcards):
-    if   wildcards["opt"] == "lm": return 1
-    elif wildcards["opt"] == "mc": return config["bayes_cores"]
-        
-rule fitn:
+rule fitn_mc:
     input:
         data = os.path.join(config["dirs"]["scape"], "{filename}_X{x}_Y{y}.dat"),
         para = fitn_pars,
     output:
-        best = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_{opt}_best.dat"),
-        last = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_{opt}_last.dat"),
-        para = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_{opt}.par"),
-    params:
+        best = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_mc_best.dat"),
+        last = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_mc_last.dat"),
+        para = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_mc.par"),
         # MC3 pickle
-        pick = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_{opt}.npz"),
+        pick = os.path.join("{dir}", "{filename}_X{x}_Y{y}", "{filename}_i{i}_j{j}_{mod}_mc.npz"),
     message:
-        "progressive fit: {wildcards[dir]}/{wildcards[filename]} looking ({wildcards[i]}, {wildcards[j]})"
+        "Bayesian sampling: {wildcards[dir]}/{wildcards[filename]} looking ({wildcards[i]}, {wildcards[j]})"
     threads:
-        fitn_threads
+        config["bayes_cores"]
     run:
-        fitn(input, output, params, wildcards, threads)
+        fitn_mc(input, output, params, wildcards, threads)
+        
+# Generate all plots for an MCMC
+rule plot_mc:
+    input:
+        pick = "{path}/{filename}.npz",
+    output:
+        trace = "{path}/{filename}_traces.png",
+        histo = "{path}/{filename}_histos.png",
+        covar = "{path}/{filename}_covars.png",
+    message:
+        "generating MCMC plots for {wildcards[filename]}"
+    run:
+        cuke = np.load(input["pick"])
+        # plot traces
+        mcp.trace(
+            cuke["posterior"], 
+            cuke["zchain"], 
+            cuke["pnames"], 
+            burnin=cuke["burnin"],
+            savefile=output["trace"],
+        )
+        # plot histos
+        mcp.histogram(
+            cuke["posterior"],
+            cuke["pnames"],
+            savefile=output["histo"],
+        )
+        # corner plots
+        mcp.pairwise(
+            cuke["posterior"],
+            cuke["pnames"],
+            savefile=output["covar"],
+        )
 
 def fitn_outs(wildcards):
     "Input function specifying all required fitns"
